@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Live Arrhythmia Detector</title>
+    <!-- Pyodide Loader -->
+    <script src="https://cdn.jsdelivr.net/pyodide/v0.25.1/full/pyodide.js"></script>
+    
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700&display=swap');
+
+        body {
+            font-family: 'Roboto', sans-serif;
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f4f7f9;
+            color: #333;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+            border-bottom: 1px solid #e0e0e0;
+            padding-bottom: 20px;
+        }
+        h1 {
+            color: #1a237e;
+            font-weight: 700;
+        }
+        .controls {
+            display: flex;
+            gap: 15px;
+            justify-content: center;
+            align-items: center;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        button {
+            padding: 12px 25px;
+            font-size: 16px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-weight: 500;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+            box-shadow: none;
+        }
+        .connect-btn {
+            background-color: #28a745;
+            color: white;
+        }
+        .connect-btn:hover:not(:disabled) {
+            background-color: #218838;
+            transform: translateY(-2px);
+        }
+        .disconnect-btn {
+            background-color: #dc3545;
+            color: white;
+        }
+        .disconnect-btn:hover:not(:disabled) {
+            background-color: #c82333;
+            transform: translateY(-2px);
+        }
+        .status-bar {
+            text-align: center;
+            padding: 12px;
+            margin: 20px 0;
+            border-radius: 8px;
+            font-weight: bold;
+            transition: background-color 0.5s ease;
+        }
+        .status-bar.connected { background-color: #d4edda; color: #155724; }
+        .status-bar.disconnected { background-color: #f8d7da; color: #721c24; }
+        .status-bar.connecting { background-color: #fff3cd; color: #856404; }
+        .status-bar.info { background-color: #cce5ff; color: #004085; }
+
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }
+        .metric-card {
+            text-align: center;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 10px;
+            border: 1px solid #dee2e6;
+        }
+        .metric-value {
+            font-size: 2.5em;
+            font-weight: 700;
+            color: #1a237e;
+        }
+        .metric-label {
+            font-size: 1.1em;
+            color: #555;
+            margin-top: 5px;
+        }
+        .detector-section {
+            margin-top: 30px;
+            padding: 20px;
+            border: 2px dashed #17a2b8;
+            border-radius: 10px;
+            background-color: #f1faff;
+        }
+        .detector-header {
+            text-align: center;
+            font-size: 1.5em;
+            font-weight: 700;
+            color: #007bff;
+            margin-bottom: 20px;
+        }
+        .countdown {
+            text-align: center;
+            font-size: 2em;
+            font-weight: bold;
+            color: #333;
+        }
+        .prediction-result {
+            margin-top: 20px;
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+            font-size: 1.4em;
+            font-weight: bold;
+            visibility: hidden;
+        }
+        .prediction-result.arrhythmia { background-color: #f8d7da; color: #721c24; }
+        .prediction-result.normal { background-color: #d4edda; color: #155724; }
+        .prediction-result.analyzing { background-color: #fff3cd; color: #856404; }
+        .confidence {
+            text-align: center;
+            margin-top: 10px;
+            font-size: 1em;
+            color: #555;
+        }
+        .chart-container {
+            height: 300px;
+            margin: 20px 0;
+        }
+        canvas {
+            width: 100%;
+            height: 100%;
+            border-radius: 8px;
+            background: #fff;
+            border: 1px solid #ddd;
+        }
+        #modelStatus { 
+            font-style: italic; 
+            color: #555;
+            text-align: center;
+            width: 100%;
+            padding: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Live Arrhythmia Detector</h1>
+            <p>Using Web Bluetooth, a Pulse Oximeter, and an in-browser Python ML Model</p>
+        </div>
+
+        <div class="detector-section">
+            <div class="detector-header">Arrhythmia Analysis</div>
+            <div id="modelStatus">Initializing...</div>
+            <div class="status-bar info" id="detectorStatus">Connect your device to begin.</div>
+            <div class="countdown" id="countdownDisplay">30s</div>
+            <div class="prediction-result" id="predictionResult">
+                <div id="predictionText"></div>
+                <div class="confidence" id="predictionConfidence"></div>
+            </div>
+        </div>
+
+        <div class="controls">
+            <button id="connectBtn" class="connect-btn" disabled>Connect to Device</button>
+            <button id="disconnectBtn" class="disconnect-btn" disabled>Disconnect</button>
+        </div>
+
+        <div id="connectionStatus" class="status-bar disconnected">Not Connected</div>
+
+        <div class="metrics-grid">
+            <div class="metric-card">
+                <div id="heartRate" class="metric-value">--</div>
+                <div class="metric-label">💓 Heart Rate (bpm)</div>
+            </div>
+            <div class="metric-card">
+                <div id="spo2" class="metric-value">--</div>
+                <div class="metric-label">🌬️ SpO₂ (%)</div>
+            </div>
+        </div>
+
+        <div class="chart-container">
+            <canvas id="plethChart"></canvas>
+        </div>
+    </div>
+
+    <script>
+        class ArrhythmiaDetectorApp {
+            constructor() {
+                // --- UI Elements ---
+                this.connectBtn = document.getElementById('connectBtn');
+                this.disconnectBtn = document.getElementById('disconnectBtn');
+                this.connectionStatus = document.getElementById('connectionStatus');
+                this.heartRateDisplay = document.getElementById('heartRate');
+                this.spo2Display = document.getElementById('spo2');
+                this.modelStatus = document.getElementById('modelStatus');
+                this.detectorStatus = document.getElementById('detectorStatus');
+                this.countdownDisplay = document.getElementById('countdownDisplay');
+                this.predictionResult = document.getElementById('predictionResult');
+                this.predictionText = document.getElementById('predictionText');
+                this.predictionConfidence = document.getElementById('predictionConfidence');
+                this.canvas = document.getElementById('plethChart');
+                this.ctx = this.canvas.getContext('2d');
+
+                // --- Bluetooth State ---
+                this.device = null;
+                this.server = null;
+                this.characteristic = null;
+                this.isConnected = false;
+
+                // --- Data & Charting State ---
+                this.plethChartBuffer = [];
+                this.maxChartBufferSize = 250;
+
+                // --- ML & Prediction State ---
+                this.pyodide = null;
+                this.isPyodideReady = false;
+                this.isModelReady = false;
+                this.predictionInterval = null;
+                this.countdown = 30;
+                this.plethDataForModel = [];
+                this.SAMPLING_RATE = 75; // Approximate rate for Wellue devices
+                this.WINDOW_SECONDS = 30;
+                this.SAMPLES_NEEDED = this.SAMPLING_RATE * this.WINDOW_SECONDS;
+
+                this.init();
+            }
+
+            init() {
+                if (!('bluetooth' in navigator)) {
+                    this.updateConnectionStatus('Web Bluetooth is not supported by your browser.', 'disconnected');
+                    return;
+                }
+                this.bindEvents();
+                this.setupCanvas();
+                this.initPyodideAndLoadModel();
+                requestAnimationFrame(() => this.animateChart());
+            }
+
+            bindEvents() {
+                this.connectBtn.addEventListener('click', () => this.connect());
+                this.disconnectBtn.addEventListener('click', () => this.disconnect());
+                window.addEventListener('resize', () => this.setupCanvas());
+            }
+            
+            async initPyodideAndLoadModel() {
+                this.modelStatus.textContent = 'Loading Python runtime...';
+                try {
+                    this.pyodide = await loadPyodide();
+                    this.modelStatus.textContent = 'Loading packages (numpy, scipy, scikit-learn)...';
+                    await this.pyodide.loadPackage(['numpy', 'scipy', 'joblib', 'scikit-learn']);
+                    this.isPyodideReady = true;
+                    this.modelStatus.textContent = 'Python ready. Downloading model...';
+                    await this.loadModelFromUrl();
+                } catch (error) {
+                    this.modelStatus.textContent = 'Error during initialization.';
+                    console.error('Initialization error:', error);
+                }
+            }
+
+            async loadModelFromUrl() {
+                if (!this.isPyodideReady) {
+                    this.modelStatus.textContent = 'Pyodide is not ready. Cannot download model.';
+                    return;
+                }
+                
+                // Using a CORS proxy to prevent cross-origin issues with Dropbox
+                const modelUrl = 'https://raw.githubusercontent.com/Artieman2010/ha/refs/heads/main/arrhythmia_detector.joblib';
+
+                try {
+                    const response = await fetch(modelUrl);
+                    if (!response.ok) {
+                        throw new Error(`Network response was not ok: ${response.statusText}`);
+                    }
+                    const buffer = await response.arrayBuffer();
+                    this.pyodide.FS.writeFile("arrhythmia_model.joblib", new Uint8Array(buffer));
+                    
+                    const pythonCode = `
+                        import joblib
+                        import numpy as np
+                        from scipy.signal import butter, filtfilt
+                        from scipy.stats import skew, kurtosis
+                        from scipy.signal import find_peaks
+
+                        loaded_data = joblib.load('arrhythmia_model.joblib')
+                        model = loaded_data['model']
+                        scaler = loaded_data['scaler']
+                        feature_columns = loaded_data['feature_columns']
+                        sampling_rate = loaded_data.get('sampling_rate', 125.0)
+                        window_length = loaded_data.get('window_length', 30)
+                        expected_samples = int(window_length * sampling_rate)
+
+                        def predict_arrhythmia(ppg_signal_js):
+                            ppg_signal = np.array(ppg_signal_js.to_py())
+
+                            if len(ppg_signal) < expected_samples:
+                                padded_signal = np.full(expected_samples, np.mean(ppg_signal) if len(ppg_signal) > 0 else 0)
+                                padded_signal[:len(ppg_signal)] = ppg_signal
+                                ppg_signal = padded_signal
+                            elif len(ppg_signal) > expected_samples:
+                                ppg_signal = ppg_signal[:expected_samples]
+
+                            try:
+                                b, a = butter(3, [0.5, 8], btype='bandpass', fs=sampling_rate)
+                                ppg_filtered = filtfilt(b, a, ppg_signal)
+                            except Exception as e:
+                                ppg_filtered = ppg_signal
+
+                            features = {}
+                            segment = ppg_filtered
+                            features['mean_ppg'] = np.mean(segment)
+                            features['std_ppg'] = np.std(segment)
+                            features['min_ppg'] = np.min(segment)
+                            features['max_ppg'] = np.max(segment)
+                            features['skewness'] = skew(segment)
+                            features['kurtosis'] = kurtosis(segment)
+                            features['rms'] = np.sqrt(np.mean(segment**2))
+
+                            fft_vals = np.fft.rfft(segment)
+                            fft_magnitude = np.abs(fft_vals)
+                            fft_freqs = np.fft.rfftfreq(len(segment), 1/sampling_rate)
+                            dominant_idx = np.argmax(fft_magnitude)
+                            features['dominant_freq'] = fft_freqs[dominant_idx]
+                            features['fft_mean'] = np.mean(fft_magnitude)
+                            features['fft_std'] = np.std(fft_magnitude)
+                            features['fft_max'] = np.max(fft_magnitude)
+                            features['fft_energy'] = np.sum(fft_magnitude**2)
+
+                            diff_signal = np.diff(segment)
+                            features['diff_mean'] = np.mean(diff_signal)
+                            features['diff_std'] = np.std(diff_signal)
+                            features['diff_max'] = np.max(np.abs(diff_signal))
+
+                            min_distance = sampling_rate * 0.3
+                            height_threshold = np.mean(segment) + 0.5 * np.std(segment)
+                            peaks, properties = find_peaks(
+                                segment,
+                                distance=min_distance,
+                                height=height_threshold,
+                                prominence=0.5
+                            )
+
+                            if len(peaks) > 1:
+                                rr_intervals = np.diff(peaks) / sampling_rate
+                                features['hr_mean'] = 60 / np.mean(rr_intervals)
+                                features['hrv_mean'] = np.mean(rr_intervals)
+                                features['hrv_std'] = np.std(rr_intervals)
+                                features['hrv_rmssd'] = np.sqrt(np.mean(np.square(np.diff(rr_intervals))))
+                                features['num_peaks'] = len(peaks)
+                                features['peak_prominence_mean'] = np.mean(properties.get('prominences', [0]))
+                            else:
+                                features.update({
+                                    'hr_mean': 0, 'hrv_mean': 0, 'hrv_std': 0,
+                                    'hrv_rmssd': 0, 'num_peaks': 0, 'peak_prominence_mean': 0
+                                })
+
+                            feature_vector = np.array([features.get(col, 0) for col in feature_columns]).reshape(1, -1)
+                            feature_vector = np.nan_to_num(feature_vector)
+                            feature_vector_scaled = scaler.transform(feature_vector)
+
+                            prediction = model.predict(feature_vector_scaled)[0]
+                            probability = model.predict_proba(feature_vector_scaled)[0]
+
+                            result = "Atrial Fibrillation Detected" if prediction == 0 else "Normal Sinus Rhythm"
+                            confidence = probability[0] if prediction == 0 else probability[1]
+
+                            return {"result": result, "confidence": float(confidence), "prediction_code": int(prediction)}
+                    `;
+                    await this.pyodide.runPythonAsync(pythonCode);
+
+                    this.isModelReady = true;
+                    this.modelStatus.textContent = 'Model loaded successfully! Ready to connect.';
+                    this.connectBtn.disabled = false;
+                } catch (error) {
+                    this.isModelReady = false;
+                    this.modelStatus.textContent = 'Error loading model from URL.';
+                    console.error('Model loading error:', error);
+                }
+            }
+
+            async connect() {
+                if (!this.isModelReady) {
+                    this.updateDetectorStatus('Model is not ready yet. Please wait.', 'info');
+                    return;
+                }
+                try {
+                    this.updateConnectionStatus('Scanning for device...', 'connecting');
+                    this.device = await navigator.bluetooth.requestDevice({
+                        filters: [{ namePrefix: 'OxySmart' }],
+                        optionalServices: ['6e400001-b5a3-f393-e0a9-e50e24dcca9e']
+                    });
+                    this.updateConnectionStatus('Connecting to device...', 'connecting');
+                    this.server = await this.device.gatt.connect();
+                    const service = await this.server.getPrimaryService('6e400001-b5a3-f393-e0a9-e50e24dcca9e');
+                    this.characteristic = await service.getCharacteristic('6e400003-b5a3-f393-e0a9-e50e24dcca9e');
+                    await this.characteristic.startNotifications();
+                    this.characteristic.addEventListener('characteristicvaluechanged', (e) => this.handleData(e.target.value));
+                    this.device.addEventListener('gattserverdisconnected', () => this.handleDisconnection());
+
+                    this.isConnected = true;
+                    this.updateConnectionStatus(`Connected to ${this.device.name}`, 'connected');
+                    this.connectBtn.disabled = true;
+                    this.disconnectBtn.disabled = false;
+                    this.startPredictionCycle();
+
+                } catch (error) {
+                    console.error('Bluetooth connection error:', error);
+                    this.updateConnectionStatus(`Connection failed: ${error.message}`, 'disconnected');
+                }
+            }
+            
+            handleData(dataValue) {
+                const data = new Uint8Array(dataValue.buffer);
+
+                if (data.length >= 10 && data[0] === 0xAA && data[1] === 0x55 && data[2] === 0x0F && data[3] === 0x07 && data[4] === 0x02) {
+                    const plethData = data.slice(5, 10);
+                    for (let i = 0; i < plethData.length; i++) {
+                        let value = plethData[i] & 0x7F;
+                        this.plethChartBuffer.push(value);
+                        if (this.predictionInterval) {
+                            this.plethDataForModel.push(value);
+                        }
+                    }
+                    if (this.plethChartBuffer.length > this.maxChartBufferSize) {
+                        this.plethChartBuffer = this.plethChartBuffer.slice(-this.maxChartBufferSize);
+                    }
+                }
+                else if (data.length === 12 && data[0] === 0xAA && data[1] === 0x55 && data[2] === 0x0F && data[3] === 0x08 && data[4] === 0x01) {
+                    const spo2 = data[5];
+                    const heartRate = data[6];
+                    this.heartRateDisplay.textContent = heartRate > 0 ? heartRate : '--';
+                    this.spo2Display.textContent = spo2 > 0 ? spo2 : '--';
+                }
+            }
+
+            startPredictionCycle() {
+                this.stopPredictionCycle();
+                this.plethDataForModel = [];
+                this.countdown = this.WINDOW_SECONDS;
+                this.updateDetectorStatus(`Collecting data for ${this.countdown}s...`, 'info');
+                
+                this.predictionInterval = setInterval(() => {
+                    this.countdown--;
+                    this.countdownDisplay.textContent = `${this.countdown}s`;
+                    if (this.countdown <= 0) {
+                        this.runPrediction();
+                    }
+                }, 1000);
+            }
+
+            stopPredictionCycle() {
+                if (this.predictionInterval) {
+                    clearInterval(this.predictionInterval);
+                    this.predictionInterval = null;
+                }
+            }
+
+            async runPrediction() {
+                this.stopPredictionCycle();
+                const dataForPrediction = [...this.plethDataForModel];
+                
+                this.updateDetectorStatus('Analyzing signal...', 'info');
+                this.showPredictionResult('Analyzing...', 'analyzing');
+
+                try {
+                    const pyPredict = this.pyodide.globals.get('predict_arrhythmia');
+                    const resultProxy = await pyPredict(dataForPrediction);
+                    const result = resultProxy.toJs({ dict_converter: Object.fromEntries });
+                    resultProxy.destroy();
+
+                    const confidenceText = `Confidence: ${(result.confidence * 100).toFixed(1)}%`;
+                    this.showPredictionResult(result.result, result.prediction_code === 0 ? 'arrhythmia' : 'normal', confidenceText);
+                    
+                } catch (error) {
+                    console.error('Prediction error:', error);
+                    this.updateDetectorStatus('An error occurred during analysis.', 'disconnected');
+                } finally {
+                    if(this.isConnected) {
+                       setTimeout(() => this.startPredictionCycle(), 2000);
+                    }
+                }
+            }
+
+            disconnect() {
+                if (this.device && this.device.gatt.connected) {
+                    this.device.gatt.disconnect();
+                } else {
+                    this.handleDisconnection();
+                }
+            }
+            
+            handleDisconnection() {
+                this.isConnected = false;
+                this.stopPredictionCycle();
+                this.updateConnectionStatus('Disconnected', 'disconnected');
+                this.connectBtn.disabled = false;
+                this.disconnectBtn.disabled = true;
+                this.heartRateDisplay.textContent = '--';
+                this.spo2Display.textContent = '--';
+                this.updateDetectorStatus('Device disconnected. Connect to resume analysis.', 'info');
+            }
+
+            updateConnectionStatus(message, type) {
+                this.connectionStatus.textContent = message;
+                this.connectionStatus.className = `status-bar ${type}`;
+            }
+
+            updateDetectorStatus(message, type) {
+                this.detectorStatus.textContent = message;
+                this.detectorStatus.className = `status-bar ${type}`;
+            }
+
+            showPredictionResult(text, type, confidence = '') {
+                this.predictionResult.style.visibility = 'visible';
+                this.predictionText.textContent = text;
+                this.predictionConfidence.textContent = confidence;
+                this.predictionResult.className = `prediction-result ${type}`;
+            }
+
+            setupCanvas() {
+                const dpr = window.devicePixelRatio || 1;
+                const rect = this.canvas.getBoundingClientRect();
+                this.canvas.width = rect.width * dpr;
+                this.canvas.height = rect.height * dpr;
+                this.ctx.scale(dpr, dpr);
+            }
+
+            animateChart() {
+                this.drawChart();
+                requestAnimationFrame(() => this.animateChart());
+            }
+
+            drawChart() {
+                const rect = this.canvas.getBoundingClientRect();
+                this.ctx.clearRect(0, 0, rect.width, rect.height);
+
+                if (this.plethChartBuffer.length < 2) return;
+
+                this.ctx.strokeStyle = '#1a237e';
+                this.ctx.lineWidth = 2;
+                this.ctx.beginPath();
+
+                const stepX = rect.width / (this.maxChartBufferSize - 1);
+                for (let i = 0; i < this.plethChartBuffer.length; i++) {
+                    const x = i * stepX;
+                    const y = rect.height - (this.plethChartBuffer[i] / 128) * rect.height;
+                    if (i === 0) this.ctx.moveTo(x, y);
+                    else this.ctx.lineTo(x, y);
+                }
+                this.ctx.stroke();
+            }
+        }
+
+        window.addEventListener('load', () => new ArrhythmiaDetectorApp());
+    </script>
+</body>
+</html>
