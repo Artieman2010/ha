@@ -171,7 +171,7 @@
     <div class="container">
         <div class="header">
             <h1>Live Arrhythmia Detector</h1>
-            <p>Using Web Bluetooth, a Pulse Oximeter, and an in-browser Python ML Model</p>
+            <p>Using Web Bluetooth, a Pulse Oximeter, and an in-browser Python Analysis Script</p>
         </div>
 
         <div class="detector-section">
@@ -234,12 +234,12 @@
 
                 // --- Data & Charting State ---
                 this.plethChartBuffer = [];
-                this.maxChartBufferSize = 250;
+                this.maxChartBufferSize = 375; // Approx 5 seconds of data at 75Hz
 
-                // --- ML & Prediction State ---
+                // --- Analysis & Prediction State ---
                 this.pyodide = null;
                 this.isPyodideReady = false;
-                this.isModelReady = false;
+                this.isAnalyzerReady = false;
                 this.predictionInterval = null;
                 this.countdown = 30;
                 this.plethDataForModel = [];
@@ -257,7 +257,7 @@
                 }
                 this.bindEvents();
                 this.setupCanvas();
-                this.initPyodideAndLoadModel();
+                this.initPyodideAndAnalyzer();
                 requestAnimationFrame(() => this.animateChart());
             }
 
@@ -267,144 +267,115 @@
                 window.addEventListener('resize', () => this.setupCanvas());
             }
             
-            async initPyodideAndLoadModel() {
+            async initPyodideAndAnalyzer() {
                 this.modelStatus.textContent = 'Loading Python runtime...';
                 try {
                     this.pyodide = await loadPyodide();
-                    this.modelStatus.textContent = 'Loading packages (numpy, scipy, scikit-learn)...';
-                    await this.pyodide.loadPackage(['numpy', 'scipy', 'joblib', 'scikit-learn']);
+                    this.modelStatus.textContent = 'Loading packages (numpy, scipy)...';
+                    await this.pyodide.loadPackage(['numpy', 'scipy']);
                     this.isPyodideReady = true;
-                    this.modelStatus.textContent = 'Python ready. Downloading model...';
-                    await this.loadModelFromUrl();
+                    this.modelStatus.textContent = 'Preparing analysis script...';
+                    await this.setupPythonAnalyzer();
                 } catch (error) {
                     this.modelStatus.textContent = 'Error during initialization.';
                     console.error('Initialization error:', error);
                 }
             }
 
-            async loadModelFromUrl() {
+            async setupPythonAnalyzer() {
                 if (!this.isPyodideReady) {
-                    this.modelStatus.textContent = 'Pyodide is not ready. Cannot download model.';
+                    this.modelStatus.textContent = 'Pyodide is not ready. Cannot prepare analyzer.';
                     return;
                 }
                 
-                // Using a CORS proxy to prevent cross-origin issues with Dropbox
-                const modelUrl = 'https://raw.githubusercontent.com/Artieman2010/ha/refs/heads/main/arrhythmia_detector.joblib';
-
                 try {
-                    const response = await fetch(modelUrl);
-                    if (!response.ok) {
-                        throw new Error(`Network response was not ok: ${response.statusText}`);
-                    }
-                    const buffer = await response.arrayBuffer();
-                    this.pyodide.FS.writeFile("arrhythmia_model.joblib", new Uint8Array(buffer));
-                    
                     const pythonCode = `
-                        import joblib
                         import numpy as np
-                        from scipy.signal import butter, filtfilt
-                        from scipy.stats import skew, kurtosis
-                        from scipy.signal import find_peaks
+                        from scipy.signal import butter, sosfiltfilt, find_peaks
 
-                        loaded_data = joblib.load('arrhythmia_model.joblib')
-                        model = loaded_data['model']
-                        scaler = loaded_data['scaler']
-                        feature_columns = loaded_data['feature_columns']
-                        sampling_rate = loaded_data.get('sampling_rate', 125.0)
-                        window_length = loaded_data.get('window_length', 30)
-                        expected_samples = int(window_length * sampling_rate)
+                        # --- Configuration ---
+                        SAMPLING_RATE = 75.0  # Hz, must match JS
+                        PRR_THRESHOLD = 75.32 # pRR3.25% threshold for AFib detection
+                        MIN_PEAKS_FOR_DETECTION = 20 # Minimum heartbeats needed for a reliable calculation
+
+                        def _ppg_bandpass_filter(data, lowcut=0.5, highcut=5.0, fs=SAMPLING_RATE, order=4):
+                            nyq = 0.5 * fs
+                            low = lowcut / nyq
+                            high = highcut / nyq
+                            sos = butter(order, [low, high], btype='band', output='sos')
+                            filtered_data = sosfiltfilt(sos, data)
+                            return filtered_data
 
                         def predict_arrhythmia(ppg_signal_js):
                             ppg_signal = np.array(ppg_signal_js.to_py())
 
-                            if len(ppg_signal) < expected_samples:
-                                padded_signal = np.full(expected_samples, np.mean(ppg_signal) if len(ppg_signal) > 0 else 0)
-                                padded_signal[:len(ppg_signal)] = ppg_signal
-                                ppg_signal = padded_signal
-                            elif len(ppg_signal) > expected_samples:
-                                ppg_signal = ppg_signal[:expected_samples]
+                            if len(ppg_signal) < 100: # Need at least some data
+                                return {"result": "Need more data", "pRR_value": 0, "prediction_code": -1}
 
+                            # 1. Filter the signal
                             try:
-                                b, a = butter(3, [0.5, 8], btype='bandpass', fs=sampling_rate)
-                                ppg_filtered = filtfilt(b, a, ppg_signal)
+                                filtered_signal = _ppg_bandpass_filter(ppg_signal)
                             except Exception as e:
-                                ppg_filtered = ppg_signal
-
-                            features = {}
-                            segment = ppg_filtered
-                            features['mean_ppg'] = np.mean(segment)
-                            features['std_ppg'] = np.std(segment)
-                            features['min_ppg'] = np.min(segment)
-                            features['max_ppg'] = np.max(segment)
-                            features['skewness'] = skew(segment)
-                            features['kurtosis'] = kurtosis(segment)
-                            features['rms'] = np.sqrt(np.mean(segment**2))
-
-                            fft_vals = np.fft.rfft(segment)
-                            fft_magnitude = np.abs(fft_vals)
-                            fft_freqs = np.fft.rfftfreq(len(segment), 1/sampling_rate)
-                            dominant_idx = np.argmax(fft_magnitude)
-                            features['dominant_freq'] = fft_freqs[dominant_idx]
-                            features['fft_mean'] = np.mean(fft_magnitude)
-                            features['fft_std'] = np.std(fft_magnitude)
-                            features['fft_max'] = np.max(fft_magnitude)
-                            features['fft_energy'] = np.sum(fft_magnitude**2)
-
-                            diff_signal = np.diff(segment)
-                            features['diff_mean'] = np.mean(diff_signal)
-                            features['diff_std'] = np.std(diff_signal)
-                            features['diff_max'] = np.max(np.abs(diff_signal))
-
-                            min_distance = sampling_rate * 0.3
-                            height_threshold = np.mean(segment) + 0.5 * np.std(segment)
-                            peaks, properties = find_peaks(
-                                segment,
-                                distance=min_distance,
-                                height=height_threshold,
-                                prominence=0.5
+                                # If filtering fails, use the raw signal but log an error
+                                print(f"Filtering failed: {e}")
+                                filtered_signal = ppg_signal
+                            
+                            # 2. Find peaks (heartbeats)
+                            # Adaptive prominence based on signal's standard deviation
+                            adaptive_prominence = 0.3 * np.std(filtered_signal)
+                            # Minimum distance between peaks corresponds to a max HR of ~220 bpm
+                            min_peak_distance = SAMPLING_RATE / (220 / 60) 
+                            
+                            peaks, _ = find_peaks(
+                                filtered_signal, 
+                                prominence=adaptive_prominence, 
+                                distance=min_peak_distance
                             )
 
-                            if len(peaks) > 1:
-                                rr_intervals = np.diff(peaks) / sampling_rate
-                                features['hr_mean'] = 60 / np.mean(rr_intervals)
-                                features['hrv_mean'] = np.mean(rr_intervals)
-                                features['hrv_std'] = np.std(rr_intervals)
-                                features['hrv_rmssd'] = np.sqrt(np.mean(np.square(np.diff(rr_intervals))))
-                                features['num_peaks'] = len(peaks)
-                                features['peak_prominence_mean'] = np.mean(properties.get('prominences', [0]))
+                            if len(peaks) < MIN_PEAKS_FOR_DETECTION:
+                                return {
+                                    "result": f"Collecting heartbeats... ({len(peaks)}/{MIN_PEAKS_FOR_DETECTION})", 
+                                    "pRR_value": 0, 
+                                    "prediction_code": -1
+                                }
+
+                            # 3. Calculate RR intervals in seconds
+                            rr_intervals = np.diff(peaks) / SAMPLING_RATE
+                            
+                            if len(rr_intervals) < 2:
+                                return {"result": "Not enough intervals.", "pRR_value": 0, "prediction_code": -1}
+
+                            # 4. Calculate pRR3.25%
+                            # This is the percentage of successive RR intervals that differ by more than 32.5ms
+                            successive_diffs = np.abs(np.diff(rr_intervals))
+                            count_prr325 = np.sum(successive_diffs > 0.0325)
+                            prr_value = (count_prr325 / len(successive_diffs)) * 100
+
+                            # 5. Make determination based on the fixed threshold
+                            if prr_value > PRR_THRESHOLD:
+                                result = "Atrial Fibrillation Detected"
+                                prediction_code = 0 # AFib
                             else:
-                                features.update({
-                                    'hr_mean': 0, 'hrv_mean': 0, 'hrv_std': 0,
-                                    'hrv_rmssd': 0, 'num_peaks': 0, 'peak_prominence_mean': 0
-                                })
-
-                            feature_vector = np.array([features.get(col, 0) for col in feature_columns]).reshape(1, -1)
-                            feature_vector = np.nan_to_num(feature_vector)
-                            feature_vector_scaled = scaler.transform(feature_vector)
-
-                            prediction = model.predict(feature_vector_scaled)[0]
-                            probability = model.predict_proba(feature_vector_scaled)[0]
-
-                            result = "Atrial Fibrillation Detected" if prediction == 0 else "Normal Sinus Rhythm"
-                            confidence = probability[0] if prediction == 0 else probability[1]
-
-                            return {"result": result, "confidence": float(confidence), "prediction_code": int(prediction)}
+                                result = "Normal Sinus Rhythm"
+                                prediction_code = 1 # Normal
+                            
+                            return {"result": result, "pRR_value": float(prr_value), "prediction_code": int(prediction_code)}
                     `;
                     await this.pyodide.runPythonAsync(pythonCode);
 
-                    this.isModelReady = true;
-                    this.modelStatus.textContent = 'Model loaded successfully! Ready to connect.';
+                    this.isAnalyzerReady = true;
+                    this.modelStatus.textContent = 'Analysis script ready! Ready to connect.';
                     this.connectBtn.disabled = false;
                 } catch (error) {
-                    this.isModelReady = false;
-                    this.modelStatus.textContent = 'Error loading model from URL.';
-                    console.error('Model loading error:', error);
+                    this.isAnalyzerReady = false;
+                    this.modelStatus.textContent = 'Error preparing analysis script.';
+                    console.error('Analyzer script error:', error);
                 }
             }
 
             async connect() {
-                if (!this.isModelReady) {
-                    this.updateDetectorStatus('Model is not ready yet. Please wait.', 'info');
+                if (!this.isAnalyzerReady) {
+                    this.updateDetectorStatus('Analyzer is not ready yet. Please wait.', 'info');
                     return;
                 }
                 try {
@@ -439,6 +410,7 @@
                 if (data.length >= 10 && data[0] === 0xAA && data[1] === 0x55 && data[2] === 0x0F && data[3] === 0x07 && data[4] === 0x02) {
                     const plethData = data.slice(5, 10);
                     for (let i = 0; i < plethData.length; i++) {
+                        // Using the raw pleth value (0-127) as it's cleaner for analysis
                         let value = plethData[i] & 0x7F;
                         this.plethChartBuffer.push(value);
                         if (this.predictionInterval) {
@@ -481,7 +453,16 @@
 
             async runPrediction() {
                 this.stopPredictionCycle();
+                // We use all data collected in the window for the analysis
                 const dataForPrediction = [...this.plethDataForModel];
+                
+                if (dataForPrediction.length < this.SAMPLES_NEEDED * 0.8) { // Check if we have enough data
+                     this.updateDetectorStatus('Insufficient data collected. Retrying...', 'disconnected');
+                     if(this.isConnected) {
+                       setTimeout(() => this.startPredictionCycle(), 2000);
+                    }
+                    return;
+                }
                 
                 this.updateDetectorStatus('Analyzing signal...', 'info');
                 this.showPredictionResult('Analyzing...', 'analyzing');
@@ -492,15 +473,25 @@
                     const result = resultProxy.toJs({ dict_converter: Object.fromEntries });
                     resultProxy.destroy();
 
-                    const confidenceText = `Confidence: ${(result.confidence * 100).toFixed(1)}%`;
-                    this.showPredictionResult(result.result, result.prediction_code === 0 ? 'arrhythmia' : 'normal', confidenceText);
+                    let resultType, confidenceText;
+                    
+                    if (result.prediction_code === -1) { // Intermediate state (e.g., collecting peaks)
+                        resultType = 'info';
+                        confidenceText = '';
+                    } else { // Final determination
+                        resultType = result.prediction_code === 0 ? 'arrhythmia' : 'normal';
+                        confidenceText = `pRR3.25% Value: ${result.pRR_value.toFixed(2)}% (Threshold: >${75.32}%)`;
+                    }
+                    
+                    this.showPredictionResult(result.result, resultType, confidenceText);
                     
                 } catch (error) {
                     console.error('Prediction error:', error);
                     this.updateDetectorStatus('An error occurred during analysis.', 'disconnected');
                 } finally {
                     if(this.isConnected) {
-                       setTimeout(() => this.startPredictionCycle(), 2000);
+                       // Restart the cycle for continuous monitoring
+                       setTimeout(() => this.startPredictionCycle(), 4000); 
                     }
                 }
             }
@@ -517,7 +508,7 @@
                 this.isConnected = false;
                 this.stopPredictionCycle();
                 this.updateConnectionStatus('Disconnected', 'disconnected');
-                this.connectBtn.disabled = false;
+                this.connectBtn.disabled = this.isAnalyzerReady ? false : true;
                 this.disconnectBtn.disabled = true;
                 this.heartRateDisplay.textContent = '--';
                 this.spo2Display.textContent = '--';
@@ -565,11 +556,20 @@
                 this.ctx.beginPath();
 
                 const stepX = rect.width / (this.maxChartBufferSize - 1);
-                for (let i = 0; i < this.plethChartBuffer.length; i++) {
-                    const x = i * stepX;
-                    const y = rect.height - (this.plethChartBuffer[i] / 128) * rect.height;
-                    if (i === 0) this.ctx.moveTo(x, y);
-                    else this.ctx.lineTo(x, y);
+                
+                // Start drawing from the beginning of the buffer
+                let startIndex = Math.max(0, this.plethChartBuffer.length - this.maxChartBufferSize);
+                
+                for (let i = startIndex; i < this.plethChartBuffer.length; i++) {
+                    const x = (i - startIndex) * stepX;
+                    // Normalize y-value based on a typical 0-127 range
+                    const y = rect.height - (this.plethChartBuffer[i] / 128) * rect.height * 0.9 - (rect.height * 0.05);
+                    
+                    if (i === startIndex) {
+                        this.ctx.moveTo(x, y);
+                    } else {
+                        this.ctx.lineTo(x, y);
+                    }
                 }
                 this.ctx.stroke();
             }
