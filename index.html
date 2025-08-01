@@ -123,12 +123,6 @@
             color: #007bff;
             margin-bottom: 20px;
         }
-        .countdown {
-            text-align: center;
-            font-size: 2em;
-            font-weight: bold;
-            color: #333;
-        }
         .prediction-result {
             margin-top: 20px;
             padding: 20px;
@@ -165,20 +159,39 @@
             width: 100%;
             padding: 10px;
         }
+        .log-section {
+            margin-top: 20px;
+        }
+        .log-section h3 {
+            text-align: center;
+            color: #555;
+        }
+        #logBox {
+            width: 100%;
+            height: 150px;
+            background-color: #222;
+            color: #0f0;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 14px;
+            border: 1px solid #444;
+            border-radius: 8px;
+            padding: 10px;
+            box-sizing: border-box;
+            resize: vertical;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
             <h1>Live Arrhythmia Detector</h1>
-            <p>Using Web Bluetooth, a Pulse Oximeter, and an in-browser Python Analysis Script</p>
+            <p>Using Web Bluetooth, a Pulse Oximeter, and Cumulative In-Browser Analysis</p>
         </div>
 
         <div class="detector-section">
             <div class="detector-header">Arrhythmia Analysis</div>
             <div id="modelStatus">Initializing...</div>
             <div class="status-bar info" id="detectorStatus">Connect your device to begin.</div>
-            <div class="countdown" id="countdownDisplay">30s</div>
             <div class="prediction-result" id="predictionResult">
                 <div id="predictionText"></div>
                 <div class="confidence" id="predictionConfidence"></div>
@@ -195,7 +208,7 @@
         <div class="metrics-grid">
             <div class="metric-card">
                 <div id="heartRate" class="metric-value">--</div>
-                <div class="metric-label">💓 Heart Rate (bpm)</div>
+                <div class.metric-label">💓 Heart Rate (bpm)</div>
             </div>
             <div class="metric-card">
                 <div id="spo2" class="metric-value">--</div>
@@ -205,6 +218,11 @@
 
         <div class="chart-container">
             <canvas id="plethChart"></canvas>
+        </div>
+
+        <div class="log-section">
+            <h3>Activity Log</h3>
+            <textarea id="logBox" readonly></textarea>
         </div>
     </div>
 
@@ -219,10 +237,10 @@
                 this.spo2Display = document.getElementById('spo2');
                 this.modelStatus = document.getElementById('modelStatus');
                 this.detectorStatus = document.getElementById('detectorStatus');
-                this.countdownDisplay = document.getElementById('countdownDisplay');
                 this.predictionResult = document.getElementById('predictionResult');
                 this.predictionText = document.getElementById('predictionText');
                 this.predictionConfidence = document.getElementById('predictionConfidence');
+                this.logBox = document.getElementById('logBox');
                 this.canvas = document.getElementById('plethChart');
                 this.ctx = this.canvas.getContext('2d');
 
@@ -240,25 +258,29 @@
                 this.pyodide = null;
                 this.isPyodideReady = false;
                 this.isAnalyzerReady = false;
-                this.predictionInterval = null;
-                this.countdown = 30;
-                this.plethDataForModel = [];
-                this.SAMPLING_RATE = 75; // Approximate rate for Wellue devices
-                this.WINDOW_SECONDS = 30;
-                this.SAMPLES_NEEDED = this.SAMPLING_RATE * this.WINDOW_SECONDS;
+                this.analysisBuffer = [];
+                this.isAnalysisPeriodActive = false;
+                this.initialDelayTimer = null;
+                this.analysisInterval = null;
+
+                // --- Configuration ---
+                this.SAMPLING_RATE = 75; // Hz
+                this.INITIAL_DELAY_SECONDS = 15;
+                this.ANALYSIS_INTERVAL_MS = 8000; // Run analysis every 8 seconds
 
                 this.init();
             }
 
             init() {
                 if (!('bluetooth' in navigator)) {
-                    this.updateConnectionStatus('Web Bluetooth is not supported by your browser.', 'disconnected');
+                    this.updateConnectionStatus('Web Bluetooth is not supported by this browser.', 'disconnected');
                     return;
                 }
                 this.bindEvents();
                 this.setupCanvas();
                 this.initPyodideAndAnalyzer();
                 requestAnimationFrame(() => this.animateChart());
+                this.log('App initialized. Waiting for Python environment...');
             }
 
             bindEvents() {
@@ -266,110 +288,102 @@
                 this.disconnectBtn.addEventListener('click', () => this.disconnect());
                 window.addEventListener('resize', () => this.setupCanvas());
             }
+
+            log(message) {
+                const timestamp = new Date().toLocaleTimeString();
+                const logMessage = `[${timestamp}] ${message}`;
+                console.log(logMessage);
+                this.logBox.value += logMessage + '\n';
+                this.logBox.scrollTop = this.logBox.scrollHeight;
+            }
             
             async initPyodideAndAnalyzer() {
                 this.modelStatus.textContent = 'Loading Python runtime...';
                 try {
                     this.pyodide = await loadPyodide();
+                    this.log('Python runtime loaded.');
                     this.modelStatus.textContent = 'Loading packages (numpy, scipy)...';
                     await this.pyodide.loadPackage(['numpy', 'scipy']);
+                    this.log('Required Python packages loaded.');
                     this.isPyodideReady = true;
                     this.modelStatus.textContent = 'Preparing analysis script...';
                     await this.setupPythonAnalyzer();
                 } catch (error) {
                     this.modelStatus.textContent = 'Error during initialization.';
-                    console.error('Initialization error:', error);
+                    this.log(`Initialization error: ${error}`);
                 }
             }
 
             async setupPythonAnalyzer() {
-                if (!this.isPyodideReady) {
-                    this.modelStatus.textContent = 'Pyodide is not ready. Cannot prepare analyzer.';
-                    return;
-                }
+                if (!this.isPyodideReady) return;
                 
                 try {
                     const pythonCode = `
                         import numpy as np
                         from scipy.signal import butter, sosfiltfilt, find_peaks
 
-                        # --- Configuration ---
-                        SAMPLING_RATE = 75.0  # Hz, must match JS
-                        PRR_THRESHOLD = 75.32 # pRR3.25% threshold for AFib detection
-                        MIN_PEAKS_FOR_DETECTION = 20 # Minimum heartbeats needed for a reliable calculation
+                        SAMPLING_RATE = 75.0
+                        PRR_THRESHOLD = 75.32
+                        MIN_PEAKS_FOR_DETECTION = 20
 
                         def _ppg_bandpass_filter(data, lowcut=0.5, highcut=5.0, fs=SAMPLING_RATE, order=4):
                             nyq = 0.5 * fs
-                            low = lowcut / nyq
-                            high = highcut / nyq
-                            sos = butter(order, [low, high], btype='band', output='sos')
-                            filtered_data = sosfiltfilt(sos, data)
-                            return filtered_data
+                            sos = butter(order, [lowcut / nyq, highcut / nyq], btype='band', output='sos')
+                            return sosfiltfilt(sos, data)
 
-                        def predict_arrhythmia(ppg_signal_js):
+                        def analyze_cumulative_ppg(ppg_signal_js):
                             ppg_signal = np.array(ppg_signal_js.to_py())
 
-                            if len(ppg_signal) < 100: # Need at least some data
-                                return {"result": "Need more data", "pRR_value": 0, "prediction_code": -1}
+                            if len(ppg_signal) < SAMPLING_RATE * 5: # Need at least 5 seconds of data
+                                return {"result": "Collecting initial data...", "detail": f"{len(ppg_signal)} samples", "code": -1}
 
-                            # 1. Filter the signal
                             try:
                                 filtered_signal = _ppg_bandpass_filter(ppg_signal)
                             except Exception as e:
-                                # If filtering fails, use the raw signal but log an error
-                                print(f"Filtering failed: {e}")
                                 filtered_signal = ppg_signal
-                            
-                            # 2. Find peaks (heartbeats)
-                            # Adaptive prominence based on signal's standard deviation
+
                             adaptive_prominence = 0.3 * np.std(filtered_signal)
-                            # Minimum distance between peaks corresponds to a max HR of ~220 bpm
-                            min_peak_distance = SAMPLING_RATE / (220 / 60) 
-                            
-                            peaks, _ = find_peaks(
-                                filtered_signal, 
-                                prominence=adaptive_prominence, 
-                                distance=min_peak_distance
-                            )
+                            min_peak_distance = SAMPLING_RATE / (220 / 60)
+                            peaks, _ = find_peaks(filtered_signal, prominence=adaptive_prominence, distance=min_peak_distance)
 
                             if len(peaks) < MIN_PEAKS_FOR_DETECTION:
                                 return {
-                                    "result": f"Collecting heartbeats... ({len(peaks)}/{MIN_PEAKS_FOR_DETECTION})", 
-                                    "pRR_value": 0, 
-                                    "prediction_code": -1
+                                    "result": "Analyzing heartbeats...",
+                                    "detail": f"Detected {len(peaks)}/{MIN_PEAKS_FOR_DETECTION} beats.",
+                                    "code": -1
                                 }
 
-                            # 3. Calculate RR intervals in seconds
                             rr_intervals = np.diff(peaks) / SAMPLING_RATE
-                            
                             if len(rr_intervals) < 2:
-                                return {"result": "Not enough intervals.", "pRR_value": 0, "prediction_code": -1}
+                                return {"result": "Need more beat intervals.", "detail": "", "code": -1}
 
-                            # 4. Calculate pRR3.25%
-                            # This is the percentage of successive RR intervals that differ by more than 32.5ms
                             successive_diffs = np.abs(np.diff(rr_intervals))
                             count_prr325 = np.sum(successive_diffs > 0.0325)
                             prr_value = (count_prr325 / len(successive_diffs)) * 100
 
-                            # 5. Make determination based on the fixed threshold
                             if prr_value > PRR_THRESHOLD:
                                 result = "Atrial Fibrillation Detected"
-                                prediction_code = 0 # AFib
+                                code = 0 # AFib
                             else:
                                 result = "Normal Sinus Rhythm"
-                                prediction_code = 1 # Normal
+                                code = 1 # Normal
                             
-                            return {"result": result, "pRR_value": float(prr_value), "prediction_code": int(prediction_code)}
+                            return {
+                                "result": result, 
+                                "detail": f"pRR3.25%: {prr_value:.2f}% | Beats: {len(peaks)}",
+                                "code": code
+                            }
                     `;
                     await this.pyodide.runPythonAsync(pythonCode);
 
                     this.isAnalyzerReady = true;
-                    this.modelStatus.textContent = 'Analysis script ready! Ready to connect.';
+                    this.modelStatus.textContent = 'Analysis script ready! You can now connect.';
                     this.connectBtn.disabled = false;
+                    this.log('Python analysis script is ready.');
                 } catch (error) {
                     this.isAnalyzerReady = false;
                     this.modelStatus.textContent = 'Error preparing analysis script.';
-                    console.error('Analyzer script error:', error);
+                    this.log(`Analyzer script error: ${error}`);
                 }
             }
 
@@ -379,28 +393,35 @@
                     return;
                 }
                 try {
+                    this.log('Requesting Bluetooth device...');
                     this.updateConnectionStatus('Scanning for device...', 'connecting');
                     this.device = await navigator.bluetooth.requestDevice({
                         filters: [{ namePrefix: 'OxySmart' }],
                         optionalServices: ['6e400001-b5a3-f393-e0a9-e50e24dcca9e']
                     });
+                    this.log(`Device found: ${this.device.name}. Connecting...`);
                     this.updateConnectionStatus('Connecting to device...', 'connecting');
                     this.server = await this.device.gatt.connect();
                     const service = await this.server.getPrimaryService('6e400001-b5a3-f393-e0a9-e50e24dcca9e');
                     this.characteristic = await service.getCharacteristic('6e400003-b5a3-f393-e0a9-e50e24dcca9e');
-                    await this.characteristic.startNotifications();
+                    
                     this.characteristic.addEventListener('characteristicvaluechanged', (e) => this.handleData(e.target.value));
+                    await this.characteristic.startNotifications();
+                    
                     this.device.addEventListener('gattserverdisconnected', () => this.handleDisconnection());
 
                     this.isConnected = true;
                     this.updateConnectionStatus(`Connected to ${this.device.name}`, 'connected');
                     this.connectBtn.disabled = true;
                     this.disconnectBtn.disabled = false;
-                    this.startPredictionCycle();
+                    this.log('Connection successful. Notifications started.');
+                    
+                    this.startAnalysisCycle();
 
                 } catch (error) {
                     console.error('Bluetooth connection error:', error);
-                    this.updateConnectionStatus(`Connection failed: ${error.message}`, 'disconnected');
+                    this.log(`Bluetooth connection failed: ${error.message}`);
+                    this.updateConnectionStatus(`Connection failed`, 'disconnected');
                 }
             }
             
@@ -409,95 +430,87 @@
 
                 if (data.length >= 10 && data[0] === 0xAA && data[1] === 0x55 && data[2] === 0x0F && data[3] === 0x07 && data[4] === 0x02) {
                     const plethData = data.slice(5, 10);
-                    for (let i = 0; i < plethData.length; i++) {
-                        // Using the raw pleth value (0-127) as it's cleaner for analysis
-                        let value = plethData[i] & 0x7F;
-                        this.plethChartBuffer.push(value);
-                        if (this.predictionInterval) {
-                            this.plethDataForModel.push(value);
+                    for (let value of plethData) {
+                        let processedValue = value & 0x7F;
+                        this.plethChartBuffer.push(processedValue);
+                        if (this.isAnalysisPeriodActive) {
+                            this.analysisBuffer.push(processedValue);
                         }
                     }
                     if (this.plethChartBuffer.length > this.maxChartBufferSize) {
-                        this.plethChartBuffer = this.plethChartBuffer.slice(-this.maxChartBufferSize);
+                        this.plethChartBuffer.splice(0, this.plethChartBuffer.length - this.maxChartBufferSize);
                     }
                 }
                 else if (data.length === 12 && data[0] === 0xAA && data[1] === 0x55 && data[2] === 0x0F && data[3] === 0x08 && data[4] === 0x01) {
-                    const spo2 = data[5];
-                    const heartRate = data[6];
-                    this.heartRateDisplay.textContent = heartRate > 0 ? heartRate : '--';
-                    this.spo2Display.textContent = spo2 > 0 ? spo2 : '--';
+                    this.spo2Display.textContent = data[5] > 0 ? data[5] : '--';
+                    this.heartRateDisplay.textContent = data[6] > 0 ? data[6] : '--';
                 }
             }
 
-            startPredictionCycle() {
-                this.stopPredictionCycle();
-                this.plethDataForModel = [];
-                this.countdown = this.WINDOW_SECONDS;
-                this.updateDetectorStatus(`Collecting data for ${this.countdown}s...`, 'info');
+            startAnalysisCycle() {
+                this.clearTimers();
+                this.analysisBuffer = [];
+                this.isAnalysisPeriodActive = false;
                 
-                this.predictionInterval = setInterval(() => {
-                    this.countdown--;
-                    this.countdownDisplay.textContent = `${this.countdown}s`;
-                    if (this.countdown <= 0) {
+                const statusMessage = `Waiting ${this.INITIAL_DELAY_SECONDS}s for signal to stabilize...`;
+                this.updateDetectorStatus(statusMessage, 'info');
+                this.log(statusMessage);
+
+                this.initialDelayTimer = setTimeout(() => {
+                    this.log('Initial delay over. Starting continuous analysis.');
+                    this.isAnalysisPeriodActive = true;
+                    this.runPrediction(); // Run the first analysis immediately
+                    
+                    // Then set up the interval for subsequent analyses
+                    this.analysisInterval = setInterval(() => {
                         this.runPrediction();
-                    }
-                }, 1000);
+                    }, this.ANALYSIS_INTERVAL_MS);
+
+                }, this.INITIAL_DELAY_SECONDS * 1000);
             }
 
-            stopPredictionCycle() {
-                if (this.predictionInterval) {
-                    clearInterval(this.predictionInterval);
-                    this.predictionInterval = null;
-                }
+            clearTimers() {
+                if (this.initialDelayTimer) clearTimeout(this.initialDelayTimer);
+                if (this.analysisInterval) clearInterval(this.analysisInterval);
+                this.initialDelayTimer = null;
+                this.analysisInterval = null;
             }
 
             async runPrediction() {
-                this.stopPredictionCycle();
-                // We use all data collected in the window for the analysis
-                const dataForPrediction = [...this.plethDataForModel];
-                
-                if (dataForPrediction.length < this.SAMPLES_NEEDED * 0.8) { // Check if we have enough data
-                     this.updateDetectorStatus('Insufficient data collected. Retrying...', 'disconnected');
-                     if(this.isConnected) {
-                       setTimeout(() => this.startPredictionCycle(), 2000);
-                    }
+                if (!this.isAnalysisPeriodActive || this.analysisBuffer.length === 0) {
+                    this.log('Skipping analysis: not ready or no data.');
                     return;
                 }
-                
-                this.updateDetectorStatus('Analyzing signal...', 'info');
+
+                this.log(`Running analysis on ${this.analysisBuffer.length} cumulative samples...`);
+                this.updateDetectorStatus('Analyzing cumulative signal...', 'info');
                 this.showPredictionResult('Analyzing...', 'analyzing');
 
                 try {
-                    const pyPredict = this.pyodide.globals.get('predict_arrhythmia');
-                    const resultProxy = await pyPredict(dataForPrediction);
+                    const pyPredict = this.pyodide.globals.get('analyze_cumulative_ppg');
+                    const resultProxy = await pyPredict(this.analysisBuffer);
                     const result = resultProxy.toJs({ dict_converter: Object.fromEntries });
                     resultProxy.destroy();
 
-                    let resultType, confidenceText;
-                    
-                    if (result.prediction_code === -1) { // Intermediate state (e.g., collecting peaks)
-                        resultType = 'info';
-                        confidenceText = '';
-                    } else { // Final determination
-                        resultType = result.prediction_code === 0 ? 'arrhythmia' : 'normal';
-                        confidenceText = `pRR3.25% Value: ${result.pRR_value.toFixed(2)}% (Threshold: >${75.32}%)`;
-                    }
-                    
-                    this.showPredictionResult(result.result, resultType, confidenceText);
+                    this.log(`Analysis result: ${result.result} | Details: ${result.detail}`);
+
+                    let resultType;
+                    if (result.code === -1) resultType = 'analyzing';
+                    else if (result.code === 0) resultType = 'arrhythmia';
+                    else resultType = 'normal';
+
+                    this.showPredictionResult(result.result, resultType, result.detail);
+                    this.updateDetectorStatus('Analysis complete. Monitoring...', 'connected');
                     
                 } catch (error) {
-                    console.error('Prediction error:', error);
+                    this.log(`Prediction error: ${error}`);
                     this.updateDetectorStatus('An error occurred during analysis.', 'disconnected');
-                } finally {
-                    if(this.isConnected) {
-                       // Restart the cycle for continuous monitoring
-                       setTimeout(() => this.startPredictionCycle(), 4000); 
-                    }
                 }
             }
 
             disconnect() {
                 if (this.device && this.device.gatt.connected) {
+                    this.log('User initiated disconnect.');
                     this.device.gatt.disconnect();
                 } else {
                     this.handleDisconnection();
@@ -505,14 +518,20 @@
             }
             
             handleDisconnection() {
+                if (!this.isConnected) return; // Prevent multiple calls
+                this.log('Device disconnected.');
                 this.isConnected = false;
-                this.stopPredictionCycle();
+                this.isAnalysisPeriodActive = false;
+                this.clearTimers();
+                
                 this.updateConnectionStatus('Disconnected', 'disconnected');
+                this.updateDetectorStatus('Device disconnected. Connect to resume.', 'info');
                 this.connectBtn.disabled = this.isAnalyzerReady ? false : true;
                 this.disconnectBtn.disabled = true;
                 this.heartRateDisplay.textContent = '--';
                 this.spo2Display.textContent = '--';
-                this.updateDetectorStatus('Device disconnected. Connect to resume analysis.', 'info');
+                this.showPredictionResult('', '', '');
+                this.predictionResult.style.visibility = 'hidden';
             }
 
             updateConnectionStatus(message, type) {
@@ -525,10 +544,10 @@
                 this.detectorStatus.className = `status-bar ${type}`;
             }
 
-            showPredictionResult(text, type, confidence = '') {
+            showPredictionResult(text, type, detail = '') {
                 this.predictionResult.style.visibility = 'visible';
                 this.predictionText.textContent = text;
-                this.predictionConfidence.textContent = confidence;
+                this.predictionConfidence.textContent = detail;
                 this.predictionResult.className = `prediction-result ${type}`;
             }
 
@@ -556,20 +575,11 @@
                 this.ctx.beginPath();
 
                 const stepX = rect.width / (this.maxChartBufferSize - 1);
-                
-                // Start drawing from the beginning of the buffer
-                let startIndex = Math.max(0, this.plethChartBuffer.length - this.maxChartBufferSize);
-                
-                for (let i = startIndex; i < this.plethChartBuffer.length; i++) {
-                    const x = (i - startIndex) * stepX;
-                    // Normalize y-value based on a typical 0-127 range
+                for (let i = 0; i < this.plethChartBuffer.length; i++) {
+                    const x = i * stepX;
                     const y = rect.height - (this.plethChartBuffer[i] / 128) * rect.height * 0.9 - (rect.height * 0.05);
-                    
-                    if (i === startIndex) {
-                        this.ctx.moveTo(x, y);
-                    } else {
-                        this.ctx.lineTo(x, y);
-                    }
+                    if (i === 0) this.ctx.moveTo(x, y);
+                    else this.ctx.lineTo(x, y);
                 }
                 this.ctx.stroke();
             }
